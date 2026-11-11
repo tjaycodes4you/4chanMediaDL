@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# PyInstaller
+build/
+dist/
+
+# IDE
+.idea/
+
+# Runtime output
+logs/
+output/
+*.log
+debug.log
+
+# Local saved thread page used as fallback input
+site.html
