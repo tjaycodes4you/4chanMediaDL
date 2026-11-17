@@ -37,8 +37,8 @@ python gui.py
 3. Optionally paste proxies into **PROXY POOL** (see below).
 4. **DOWNLOAD**. Progress bar, per-file log, and `ABORT` are all live.
 
-The pool and output settings are remembered, the proxy list in
-`user_data/proxies.txt`.
+The proxy list is remembered in `user_data/proxies.txt`; the output directory is
+not persisted.
 
 ## Run the CLI
 
