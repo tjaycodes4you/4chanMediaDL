@@ -1,61 +1,14 @@
-import asyncio
+﻿import asyncio
 import datetime
 import json
 from logging import Logger
-from random import shuffle, randint
+from random import randint
 from urllib.parse import urlparse
 
 import wreq
-from wreq import Client, Jar, Response, Proxy, Emulation, Multipart, OrigHeaderMap, TlsOptions
+from wreq import Client, Jar, Proxy, Response, Emulation, Multipart, OrigHeaderMap
 from wreq.exceptions import RequestError
-from wreq.http2 import Http2Options, PseudoOrder, PseudoId
 from wreq.redirect import Policy
-
-from utils.root import get_project_root
-
-
-# Proxy stuff
-def load_proxies():
-    """Legacy proxy loader - kept for backward compatibility."""
-    global RAW_PROXIES
-    with open(f'{get_project_root()}/user_data/proxies.txt', 'r', encoding='utf-8') as f:
-        RAW_PROXIES = [line.strip().split(':') for line in f.readlines() if line.strip()]
-
-
-async def async_cycle():
-    """Legacy proxy cycling - kept for backward compatibility."""
-    saved_items = RAW_PROXIES
-    shuffle(saved_items)
-    if not saved_items:
-        return
-    while True:
-        for item in saved_items:
-            yield item
-
-
-async def get_next_proxy():
-    return await PROXIES.__anext__()
-
-
-async def test_next_proxy():
-    for _ in range(20):
-        print(await get_next_proxy())
-
-
-# load_proxies()
-# PROXIES = async_cycle()
-
-
-def build_proxy_url(raw_proxy: list[str] | None) -> str | None:
-    if not raw_proxy or len(raw_proxy) < 4:
-        return None
-    ip, port, user, password = raw_proxy[:4]
-    if not all([ip, port]):
-        return None
-    credentials = ''
-    if user and password:
-        credentials = f'{user}:{password}@'
-    return f'http://{credentials}{ip}:{port}'
 
 
 # request client
@@ -92,36 +45,8 @@ def rnet_client(proxy: str | None = None,
         allow_redirects = Policy.limited()
     else:
         allow_redirects = Policy.none()
-    http2_options = Http2Options(
-        initial_window_size=65535,  # Conservative window size
-        max_frame_size=16384,  # Standard frame size
-        header_table_size=4096,  # Smaller header table
-        max_concurrent_streams=100,  # Limit concurrent streams
-        enable_push=False,  # Disable server push
-    )
-    tls_options = TlsOptions(
-        grease_enabled=True,  # Send GREASE extensions
-        permute_extensions=True,  # Randomize extension order
-        enable_ocsp_stapling=True,  # Enable OCSP stapling
-    )
-    # Create custom pseudo-header order
-    pseudo_order = PseudoOrder(
-        PseudoId.METHOD,
-        PseudoId.AUTHORITY,
-        PseudoId.SCHEME,
-        PseudoId.PATH,
-    )
-
-    # Apply to HTTP/2 options
-    http2_options = Http2Options(
-        headers_pseudo_order=pseudo_order
-    )
     client = Client(
         emulation=Emulation.Chrome145,
-        # http2_options=http2_options,
-        # tls_options=tls_options,
-        # http1_only=True,
-        # tls_options=chrome_144_tls(),
         proxies=proxy,
         verify=verify,
         redirect=allow_redirects,
@@ -202,11 +127,17 @@ async def send_request(
                                         redirect=redirect, cookies=cookies, version=version)
             if (status := resp.status.as_int()) not in good_statuses:
                 if status == 429:
-                    four_two_nine_delay = randint(*four_two_nine_delay)
-                    # LOG.warning(
-                    #     f"Try #{_try} - HTTP request failed for {method} on {url} - Status Code - {resp.status}."
-                    #     f" Sleeping for {four_two_nine_delay} seconds.")
-                    await asyncio.sleep(four_two_nine_delay)
+                    retry_after = resp.headers.get('retry-after')
+                    try:
+                        wait = int(bytes(retry_after)) if retry_after else randint(*four_two_nine_delay)
+                    except (TypeError, ValueError):
+                        wait = randint(*four_two_nine_delay)
+                    if _try + 1 >= tries or wait > 120:
+                        log.warning(
+                            f"Rate limited by [{urlparse(url).netloc}] - HTTP 429 - Retry-After {wait}s")
+                        return None
+                    log.warning(f"Rate limited by [{urlparse(url).netloc}] - HTTP 429 - sleeping {wait}s")
+                    await asyncio.sleep(wait)
                     continue
                 log.error(
                     f"Try #{_try} - HTTP request failed for {method} on {url} - Status Code: {resp.status}")
@@ -245,86 +176,3 @@ async def send_request(
             log.exception(e)
             log.error(f"Try #{_try} - HTTP request failed for {method} on {url}, Unrecognized error: {e}")
     return None
-
-
-def ensure_webhook_client():
-    global WEBHOOK_CLIENT
-    if not WEBHOOK_CLIENT:
-        WEBHOOK_CLIENT = rnet_client(proxy=None)
-
-
-async def send_webhook(url: str | None, title: str, color: int, fields: list[dict], file_content: str | None = None, filename: str = "traceback.txt"):
-    """
-    Light Blue: 11393254 (Hex: #ADD8E6)
-    Light Green: 9498256 (Hex: #90EE90)
-    {"name": "Event", "value": "Ice Hockey Final", "inline": True}
-
-    Args:
-        url: Discord webhook URL
-        title: Embed title
-        color: Embed color (integer)
-        fields: List of embed fields
-        file_content: Optional text content to upload as a file (e.g., traceback)
-        filename: Name of the file to upload (default: traceback.txt)
-    """
-    global WEBHOOK_CLIENT
-    if not WEBHOOK_CLIENT:
-        WEBHOOK_CLIENT = rnet_client(
-            # proxy='http://localhost:8888', verify=False
-        )
-    payload = {
-        "embeds": [
-            {
-                # "content": "@everyone",
-                "title": title,
-                "color": color,
-                "fields": fields,
-                "footer": {
-                    "text": "Olympics LA Bot - [@tjaycodes4you]",
-                    "icon_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQqqCwwKUibRgUj0Eu4jusRmJnM3i4pEpF0UQ&s"
-                },
-                "timestamp": datetime.datetime.utcnow().isoformat(timespec='milliseconds')
-            }
-        ]
-    }
-
-    # Send to provided URL if exists
-    if file_content:
-        # Use multipart upload with file attachment for Discord webhooks
-        payload_part = wreq.Part(
-            name="payload_json",
-            value=json.dumps(payload),
-            mime="application/json"
-        )
-        file_part = wreq.Part(
-            name="file",
-            value=file_content,
-            filename=filename,
-            mime="text/plain"
-        )
-        multipart = wreq.Multipart(payload_part, file_part)
-
-        task = send_request(
-            WEBHOOK_CLIENT,
-            url=url,
-            method='POST',
-            headers={},
-            multipart=multipart,
-            good_statuses=[200, 204]
-        )
-    else:
-        task = send_request(
-            WEBHOOK_CLIENT,
-            url=url,
-            method='POST',
-            json_body=payload,
-            good_statuses=[200, 204],
-            headers={"Content-Type": "application/json"}
-        )
-
-    async with WEBHOOK_SEM:
-        await task
-
-
-if __name__ == '__main__':
-    pass

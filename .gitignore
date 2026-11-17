@@ -17,5 +17,8 @@ output/
 *.log
 debug.log
 
+# Local credentials (saved proxy pool)
+user_data/
+
 # Local saved thread page used as fallback input
 site.html

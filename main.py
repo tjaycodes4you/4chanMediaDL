@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import html
+import itertools
 import re
 from asyncio import Semaphore
 from pathlib import Path
@@ -9,11 +10,57 @@ from utils.custom_log_format import logger
 from utils.root import get_project_root
 from utils.tools import rnet_client, send_request
 
-CLIENT = rnet_client()
 LOG = logger(name="main")
 ROOT = Path(get_project_root())
 SITE_FILE = ROOT / 'site.html'
-DEFAULT_FOLDER = ROOT / 'output' / 'su hoes'
+DEFAULT_FOLDER = ROOT / 'output' / 'downloads'
+DIRECT = 'direct'
+
+CLIENT_POOL = [(DIRECT, rnet_client())]
+CLIENT_CYCLE = itertools.cycle(CLIENT_POOL)
+
+
+def next_client() -> tuple[str, object]:
+    return next(CLIENT_CYCLE)
+
+
+def parse_proxy(line: str) -> tuple[str, str] | None:
+    if '://' in line:
+        return line.split('://', 1)[1].split('@')[-1].split('/')[0], line
+    parts = line.split(':')
+    if len(parts) == 4:
+        host, port, user, password = parts
+        return f'{host}:{port}', f'http://{user}:{password}@{host}:{port}'
+    if len(parts) == 2:
+        return line, f'http://{line}'
+    return None
+
+
+def load_proxy_lines(value: str) -> list[str]:
+    path = Path(value.strip())
+    if '\n' not in value.strip() and path.is_file():
+        lines = path.read_text(encoding='utf-8').splitlines()
+    else:
+        lines = value.splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.strip().startswith('#')]
+
+
+def set_proxies(lines: list[str]) -> int:
+    global CLIENT_POOL, CLIENT_CYCLE
+    pool = []
+    for line in lines:
+        parsed = parse_proxy(line)
+        if not parsed:
+            LOG.warning(f"Ignoring malformed proxy line [{line[:48]}]")
+            continue
+        label, url = parsed
+        try:
+            pool.append((label, rnet_client(proxy=url)))
+        except Exception as e:
+            LOG.warning(f"Ignoring proxy [{label}]: {e}")
+    CLIENT_POOL = pool or [(DIRECT, rnet_client())]
+    CLIENT_CYCLE = itertools.cycle(CLIENT_POOL)
+    return len(pool)
 
 MEDIA_RE = re.compile(r'fileText.+?href="(.+?)".+?>(.+?)<')
 INVALID_CHARS = re.compile(r'[<>:"/\\|?*]')
@@ -74,15 +121,28 @@ def parse_media(src: str) -> list[list[str]]:
 
 
 async def fetch_thread(url: str) -> str:
+    label, client = next_client()
     src = await send_request(
-        client=CLIENT,
+        client=client,
+        url=url,
+        headers=PAGE_HEADERS,
+        log=LOG,
+        good_statuses=[200],
+    )
+    if src:
+        return src
+    if label == DIRECT:
+        raise RuntimeError(f"Failed to fetch thread page: {url}")
+    LOG.warning(f"Thread page failed via [{label}] - retrying direct")
+    src = await send_request(
+        client=rnet_client(),
         url=url,
         headers=PAGE_HEADERS,
         log=LOG,
         good_statuses=[200],
     )
     if not src:
-        raise RuntimeError(f"Failed to fetch thread page: {url}")
+        raise RuntimeError(f"Failed to fetch thread page direct: {url}")
     return src
 
 
@@ -96,15 +156,21 @@ async def download_image(url: str, name: str, output_dir: Path, sem: Semaphore, 
             on_done(name, 'skipped')
         return
     async with sem:
+        await asyncio.sleep(0.2)
+        label, client = next_client()
         response = await send_request(
             url=url,
             headers=MEDIA_HEADERS,
             log=LOG,
-            client=CLIENT,
+            client=client,
             good_statuses=[206],
-            return_resp=True
+            return_resp=True,
+            tries=2,
         )
         if response is None:
+            LOG.error(f"Failed [{name}] via [{label}] - no response from CDN (see rate-limit warning)")
+            if on_done:
+                on_done(name, 'failed')
             return
         LOG.debug(f"Downloading media [{name}]")
         async with response:
@@ -142,15 +208,23 @@ async def run(url: str | None, output: str | None, on_done=None, on_total=None, 
     if on_total:
         on_total(len(media))
     LOG.info(f"Downloading [{len(media)}] files to [{output_dir}]")
-    sem = Semaphore(30)
+    sem = Semaphore(4)
     await asyncio.gather(*(download_image(u, n, output_dir, sem=sem, on_done=on_done, cancel=cancel) for u, n in media))
 
 
 def main():
     parser = argparse.ArgumentParser(description="Download all media from a 4chan thread")
     parser.add_argument('url', nargs='?', help="4chan thread URL (defaults to site.html in project root)")
-    parser.add_argument('-o', '--output', help="Output folder (defaults to output/<board> or output/su hoes)")
+    parser.add_argument('-o', '--output', help="Output folder (defaults to output/<board> or output/downloads)")
+    parser.add_argument('-p', '--proxy', action='append', default=[],
+                        help="Proxy line host:port[:user:pass] (repeatable)")
+    parser.add_argument('--proxy-file', help="File with one proxy per line")
     args = parser.parse_args()
+    lines = list(args.proxy)
+    if args.proxy_file:
+        lines += load_proxy_lines(args.proxy_file)
+    if lines:
+        LOG.info(f"Proxy pool: [{set_proxies(lines)}] line(s)")
     asyncio.run(run(args.url, args.output))
 
 

@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
-from main import run
+from main import load_proxy_lines, run, set_proxies
 from utils.root import get_project_root
 
 
@@ -64,6 +64,27 @@ def asset(name: str) -> str | None:
         if p.exists():
             return str(p)
     return None
+
+
+PROXY_FILE = Path(get_project_root()) / 'user_data' / 'proxies.txt'
+
+
+def load_saved_proxies() -> str:
+    try:
+        return PROXY_FILE.read_text(encoding='utf-8').strip()
+    except OSError:
+        return ''
+
+
+def save_proxies(text: str):
+    text = text.strip()
+    if not text:
+        return
+    try:
+        PROXY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PROXY_FILE.write_text(text + '\n', encoding='utf-8')
+    except OSError:
+        pass
 
 
 def bind_drag(widget, on_press, on_motion):
@@ -158,6 +179,7 @@ class App:
         self.worker_thread = None
         self.total = 0
         self.done = 0
+        self.failed = 0
 
         self.qh = QueueLogHandler(self.q)
         self.qh.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
@@ -245,6 +267,16 @@ class App:
                       text_color=CYAN, border_color='#12507a', fg_color='#06121e',
                       hover_color='#0a2136', command=self.browse).pack(side='left', padx=(8, 0))
 
+        ctk.CTkLabel(body, text='// PROXY POOL — ISP / DC  (host:port:user:pass per line, or a .txt path)',
+                     font=SECTION_FONT, text_color=CYAN).pack(anchor='w')
+        self.proxy_box = ctk.CTkTextbox(body, height=58, font=MONO_SMALL, wrap='none',
+                                        border_color='#1c3a2a', text_color='#c8ffd8',
+                                        activate_scrollbars=True)
+        self.proxy_box.pack(fill='x', pady=(4, 16))
+        saved = load_saved_proxies()
+        if saved:
+            self.proxy_box.insert('1.0', saved)
+
         action_row = ctk.CTkFrame(body, fg_color='transparent')
         action_row.pack(fill='x', pady=(0, 14))
         self.dl_btn = ctk.CTkButton(action_row, text='▶  DOWNLOAD', height=44, font=('Bahnschrift', 15, 'bold'),
@@ -323,9 +355,14 @@ class App:
     def start(self):
         url = self.url_entry.get().strip() or None
         out = self.out_entry.get().strip() or None
+        raw = self.proxy_box.get('1.0', 'end').strip()
+        save_proxies(raw)
+        count = set_proxies(load_proxy_lines(raw) if raw else [])
+        self.log(('INFO', f'Proxy pool: {count} line(s)' if count else 'Proxy pool: direct'))
         self.cancel.clear()
         self.total = 0
         self.done = 0
+        self.failed = 0
         self.draw_bar(0)
         self.status_var.set('STARTING...')
         self.dl_btn.configure(state='disabled')
@@ -365,9 +402,13 @@ class App:
                     self.status_var.set(f'0 / {self.total}')
                 elif kind == 'done':
                     name, status = payload
+                    if status == 'failed':
+                        self.failed += 1
+                        self.log(('ERROR', f'[FAIL] {name}'), tag='err')
+                        continue
                     self.done += 1
                     self.draw_bar(self.done / max(self.total, 1))
-                    self.status_var.set(f'{self.done} / {self.total}')
+                    self.status_var.set(f'{self.done} / {self.total}' + (f' - {self.failed} failed' if self.failed else ''))
                     if status == 'skipped':
                         self.log(('INFO', f'[SKIP] {name}'), tag='warn')
                     else:
@@ -380,8 +421,10 @@ class App:
                         self.status_var.set('NO MEDIA FOUND - CHECK LOG')
                         self.log(('ERROR', 'No media found. If the URL is empty, put site.html next to the exe.'))
                     else:
-                        self.status_var.set(f'DONE - {self.done} files')
-                        self.log(('INFO', 'Done.'))
+                        tail = f' - {self.failed} failed' if self.failed else ''
+                        self.status_var.set(f'DONE - {self.done} files{tail}')
+                        self.log((('ERROR' if self.failed else 'INFO'),
+                                  f'Done. {self.done} downloaded, {self.failed} failed.'))
                     self.dl_btn.configure(state='normal')
                     self.cancel_btn.configure(state='disabled')
                     self.cancel.clear()
@@ -429,6 +472,7 @@ class App:
             if not messagebox.askyesno('4chanMediaDL', 'Download in progress. Quit anyway?'):
                 return
             self.cancel.set()
+        save_proxies(self.proxy_box.get('1.0', 'end'))
         self.root.destroy()
 
 
@@ -440,7 +484,7 @@ def main():
         ctk.set_default_color_theme(theme)
 
     root = ctk.CTk()
-    root.geometry('760x600')
+    root.geometry('760x700')
     root.withdraw()
     dbg('root withdrawn')
 
